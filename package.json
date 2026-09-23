@@ -1,6 +1,6 @@
 {
   "name": "@mxalbert/opencode-prune-images",
-  "version": "1.2.0",
+  "version": "2.0.0",
   "description": "OpenCode v2 plugin that bounds image count and payload size in the outgoing request while preserving recall cards.",
   "type": "module",
   "main": "index.ts",
