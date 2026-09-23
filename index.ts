@@ -6,8 +6,9 @@
  * recoverable summary through contextual text cards and a persistent FIFO disk
  * buffer. Provider limits and the rest of the request are outside this plugin.
  *
- * 1. Rolling Disk Buffer (~/.cache/opencode/recent-images/):
+ * 1. Rolling Disk Buffer (<cache dir>/opencode/recent-images/):
  *    - Strict FIFO limit of 100 files.
+ *    - Resolves under $XDG_CACHE_HOME when set, else ~/.cache.
  *    - Persists pasted base64 data and copies ephemeral (/tmp) screenshots.
  *    - Safe, synchronous, zero-dependency filesystem operations.
  *
@@ -22,16 +23,15 @@
  *    - Preserves up to 7 latest raw images (configurable via OPENCODE_MAX_IMAGES or setMaxImages)
  *      AND up to 16 MiB active payload bytes (configurable via OPENCODE_MAX_IMAGE_BYTES or setMaxImageBytes).
  *    - In-place mutation preserving tool call IDs, wrappers, and message structure.
- *    - V1 tool attachments pruned from state.attachments are removed from the
- *      array with their card appended to that tool part's output text, since
- *      neither provider conversion nor the compaction serializer reads card
- *      text out of a replaced attachment object.
+ *    - Targets the payload the v2 context hook exposes: tool media appears in
+ *      tool-result content values as { type: "file", uri, mime, name }.
  *
  * 4. Compaction Lifecycle Defense (Zero-Media Strip):
- *    - When event.agent === "compaction" or on /compact requests, effectiveMaxImages and effectiveMaxBytes
- *      are clamped to 0.
- *    - 100% of images are cleanly converted into 3-point context cards with zero raw base64 sent to the model,
- *      so compaction receives text cards instead of raw image data (issue #14562).
+ *    - Registers the dedicated v2 compaction session hook and prunes there with
+ *      budgets of 0, so 100% of recognized images become 3-point context cards
+ *      before the compaction model call.
+ *    - No heuristic detection is involved: the host tells us this is a
+ *      compaction.
  */
 
 import * as fs from "node:fs";
@@ -43,12 +43,13 @@ export const DEFAULT_MAX_IMAGES_IN_CONTEXT = 7;
 export const DEFAULT_MAX_IMAGE_BYTES = 16 * 1024 * 1024; // 16 MiB wire base64 length (~12 MiB raw binary)
 export const DEFAULT_MAX_CACHE_FILES = 100;
 
-export const DEFAULT_CACHE_DIR = path.join(
-  os.homedir(),
-  ".cache",
-  "opencode",
-  "recent-images"
-);
+export function resolveCacheDirFromEnv(env: NodeJS.ProcessEnv = process.env): string {
+  const xdg = env.XDG_CACHE_HOME?.trim();
+  const base = xdg && xdg.length > 0 ? path.resolve(xdg) : path.join(os.homedir(), ".cache");
+  return path.join(base, "opencode", "recent-images");
+}
+
+export const DEFAULT_CACHE_DIR = resolveCacheDirFromEnv();
 
 export function parseByteString(val: string | undefined): number | undefined {
   if (!val || typeof val !== "string") return undefined;
@@ -78,31 +79,43 @@ export function parseByteString(val: string | undefined): number | undefined {
   return Math.floor(num);
 }
 
-function resolveDefaultMaxImages(): number {
-  const envVal = process.env.OPENCODE_MAX_IMAGES;
-  if (envVal) {
-    const parsed = Number.parseInt(envVal, 10);
-    if (!Number.isNaN(parsed) && parsed > 0) {
-      return parsed;
-    }
+function parsePositiveInt(value: unknown): number | undefined {
+  const parsed = typeof value === "number" ? Math.floor(value) : Number.parseInt(String(value), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function resolveMaxImages(options?: Record<string, unknown>): number {
+  const env = parsePositiveInt(process.env.OPENCODE_MAX_IMAGES);
+  if (env !== undefined) return env;
+
+  if (options?.["maxImages"] !== undefined) {
+    const fromOptions = parsePositiveInt(options["maxImages"]);
+    if (fromOptions !== undefined) return fromOptions;
+    console.error(`[prune-images] ignoring options.maxImages: ${JSON.stringify(options["maxImages"])}`);
   }
+
   return DEFAULT_MAX_IMAGES_IN_CONTEXT;
 }
 
-function resolveDefaultMaxImageBytes(): number {
-  const envVal = process.env.OPENCODE_MAX_IMAGE_BYTES;
-  const parsed = parseByteString(envVal);
-  if (parsed && parsed > 0) {
-    return parsed;
+function resolveMaxImageBytes(options?: Record<string, unknown>): number {
+  const env = parseByteString(process.env.OPENCODE_MAX_IMAGE_BYTES);
+  if (env) return env;
+
+  if (options?.["maxImageBytes"] !== undefined) {
+    const raw = options["maxImageBytes"];
+    const fromOptions = typeof raw === "number" ? Math.floor(raw) : parseByteString(String(raw));
+    if (fromOptions && fromOptions > 0) return fromOptions;
+    console.error(`[prune-images] ignoring options.maxImageBytes: ${JSON.stringify(raw)}`);
   }
+
   return DEFAULT_MAX_IMAGE_BYTES;
 }
 
-let currentMaxImages = resolveDefaultMaxImages();
-let currentMaxImageBytes = resolveDefaultMaxImageBytes();
+let currentMaxImages = resolveMaxImages();
+let currentMaxImageBytes = resolveMaxImageBytes();
 
 export function setMaxImages(count: number): void {
-  if (typeof count === "number" && !Number.isNaN(count) && count > 0) {
+  if (typeof count === "number" && Number.isFinite(count) && count > 0) {
     currentMaxImages = Math.floor(count);
   }
 }
@@ -112,7 +125,7 @@ export function getMaxImages(): number {
 }
 
 export function setMaxImageBytes(bytes: number): void {
-  if (typeof bytes === "number" && !Number.isNaN(bytes) && bytes > 0) {
+  if (typeof bytes === "number" && Number.isFinite(bytes) && bytes > 0) {
     currentMaxImageBytes = Math.floor(bytes);
   }
 }
@@ -137,9 +150,6 @@ export function setCacheDir(dir: string): void {
 export function getCacheDir(): string {
   return currentCacheDir;
 }
-
-// In-memory lookup: hash/path key -> cached file path
-const imagePathCache = new Map<string, string>();
 
 function ensureCacheDir(): void {
   try {
@@ -312,12 +322,6 @@ export function persistToRollingCache(
         return resolvedExisting;
       }
 
-      const hashKey = `path:${resolvedExisting}`;
-      const cached = imagePathCache.get(hashKey);
-      if (cached && fs.existsSync(cached)) {
-        return cached;
-      }
-
       if (fs.existsSync(resolvedExisting)) {
         try {
           const fileBuf = fs.readFileSync(resolvedExisting);
@@ -338,15 +342,14 @@ export function persistToRollingCache(
             }
           }
 
-          imagePathCache.set(hashKey, targetPath);
           enforceCacheCap();
-          return targetPath;
+          return fs.existsSync(targetPath) ? targetPath : undefined;
         } catch {
-          return resolvedExisting;
+          return undefined;
         }
       }
 
-      return resolvedExisting;
+      return undefined;
     }
 
     // Case 2: Base64 / data URI
@@ -367,11 +370,6 @@ export function persistToRollingCache(
       }
 
       const sha = crypto.createHash("sha256").update(base64Data).digest("hex").slice(0, 16);
-      const hashKey = `base64:${sha}`;
-      const cached = imagePathCache.get(hashKey);
-      if (cached && fs.existsSync(cached)) {
-        return cached;
-      }
 
       // Decode buffer safely
       let buf: Buffer | null = null;
@@ -399,14 +397,13 @@ export function persistToRollingCache(
         fs.writeFileSync(targetPath, buf);
       }
 
-      imagePathCache.set(hashKey, targetPath);
       enforceCacheCap();
       return targetPath;
     }
 
     return undefined;
   } catch {
-    return existingPath;
+    return undefined;
   }
 }
 
@@ -422,15 +419,8 @@ export interface ImageMeta {
 }
 
 export interface ImageRef {
-  type:
-    | "part"
-    | "tool-result-value"
-    | "tool-content"
-    | "tool-attachment"
-    | "gemini-part"
-    | "raw-string";
-  container: Record<string, unknown> | unknown[];
-  keyOrIndex: string | number;
+  container: unknown[];
+  keyOrIndex: number;
   meta: ImageMeta;
   messageIndex: number;
 }
@@ -810,189 +800,35 @@ export function synthesizeContext(
 }
 
 export function formatThreePointCard(
-  cachedPath: string,
+  cachedPath: string | undefined,
   observed: string,
   intent: string
 ): string {
+  const recall = cachedPath
+    ? `• Recall: If needed again, read from \`${cachedPath}\`. If missing, rely on the summary above—or if safe to reproduce, re-capture the screen.`
+    : `• Recall: The original image was not cached and cannot be re-read; rely on the summary above, or re-capture the screen.`;
   return [
-    `[Pruned Image: ${cachedPath}]`,
+    `[Pruned Image: ${cachedPath ?? "not cached"}]`,
     `• What's visible: ${observed}`,
     `• Why it was captured: ${intent}`,
-    `• Recall: If needed again, read from \`${cachedPath}\`. If missing, rely on the summary above—or if safe to reproduce, re-capture the screen.`,
+    recall,
   ].join("\n");
 }
 
-/**
- * Recursive crawler to count all image references in any object / array tree.
- */
-export function countImagesInValue(val: unknown, seen = new Set<unknown>()): number {
-  if (!val) return 0;
-  if (typeof val === "string") {
-    return isImageDataUri(val) ? 1 : 0;
-  }
-  if (typeof val !== "object") return 0;
-
-  if (seen.has(val)) return 0;
-  seen.add(val);
-
-  if (Array.isArray(val)) {
-    let count = 0;
-    for (const item of val) {
-      count += countImagesInValue(item, seen);
-    }
-    return count;
-  }
-
-  if (isImagePart(val)) {
-    return 1;
-  }
-
-  let count = 0;
-  const obj = val as Record<string, unknown>;
-  for (const key of Object.keys(obj)) {
-    count += countImagesInValue(obj[key], seen);
-  }
-  return count;
-}
-
 export function countImagesInMessages(messages: unknown[]): number {
-  let count = 0;
-  const seen = new Set<unknown>();
-
-  for (const msg of messages) {
-    if (!msg || typeof msg !== "object") continue;
-    const m = msg as Record<string, unknown>;
-
-    if (typeof m.content === "string" && isImageDataUri(m.content)) {
-      count++;
-    }
-
-    const parts = Array.isArray(m.parts)
-      ? m.parts
-      : Array.isArray(m.content)
-        ? m.content
-        : null;
-
-    if (!parts) continue;
-
-    for (const part of parts) {
-      if (!part || typeof part !== "object") continue;
-
-      if (isImagePart(part)) {
-        count++;
-        continue;
-      }
-
-      count += countImagesInValue(part, seen);
-    }
-  }
-
-  return count;
+  const refs: ImageRef[] = [];
+  collectImageRefs(messages, refs);
+  return refs.length;
 }
 
 /**
- * Recursively inspect an object or array to find and collect all nested images.
- */
-function collectNestedImageRefs(
-  val: unknown,
-  toolSource: string | undefined,
-  messageIndex: number,
-  target: ImageRef[],
-  seen = new Set<unknown>()
-): void {
-  if (!val || typeof val !== "object") return;
-  if (seen.has(val)) return;
-  seen.add(val);
-
-  if (Array.isArray(val)) {
-    for (let i = 0; i < val.length; i++) {
-      const item = val[i];
-      if (!item) continue;
-
-      if (typeof item === "string") {
-        if (isImageDataUri(item)) {
-          target.push({
-            type: "raw-string",
-            container: val,
-            keyOrIndex: i,
-            meta: {
-              mime: extractMimeFromDataUri(item),
-              source: toolSource,
-              rawBase64: item,
-            },
-            messageIndex,
-          });
-        }
-        continue;
-      }
-
-      if (typeof item === "object") {
-        if (isImagePart(item)) {
-          target.push({
-            type: "part",
-            container: val,
-            keyOrIndex: i,
-            meta: extractImageMeta(item, toolSource),
-            messageIndex,
-          });
-        } else {
-          const itemObj = item as Record<string, unknown>;
-          const nestedTool = itemObj.tool || itemObj.toolName;
-          const nestedToolSource = nestedTool ? `tool (${nestedTool})` : toolSource;
-          collectNestedImageRefs(item, nestedToolSource, messageIndex, target, seen);
-        }
-      }
-    }
-    return;
-  }
-
-  const obj = val as Record<string, unknown>;
-  for (const key of Object.keys(obj)) {
-    const child = obj[key];
-    if (!child) continue;
-
-    if (typeof child === "string") {
-      if (isImageDataUri(child)) {
-        target.push({
-          type: "raw-string",
-          container: obj,
-          keyOrIndex: key,
-          meta: {
-            mime: extractMimeFromDataUri(child),
-            source: toolSource,
-            rawBase64: child,
-          },
-          messageIndex,
-        });
-      }
-      continue;
-    }
-
-    if (typeof child === "object") {
-      if (isImagePart(child)) {
-        target.push({
-          type: "part",
-          container: obj,
-          keyOrIndex: key,
-          meta: extractImageMeta(child, toolSource),
-          messageIndex,
-        });
-      } else {
-        const childObj = child as Record<string, unknown>;
-        const nestedTool = childObj.tool || childObj.toolName;
-        const nestedToolSource = nestedTool ? `tool (${nestedTool})` : toolSource;
-        collectNestedImageRefs(child, nestedToolSource, messageIndex, target, seen);
-      }
-    }
-  }
-}
-
-/**
- * Collect all image references in strict chronological order with message indices.
+ * Collect image references from the two positions the context hook exposes:
+ * top-level message content parts, and tool-result content values
+ * (part.result.value[]). Arbitrary object properties, such as tool-call input
+ * arguments, are deliberately not traversed — mutating those would corrupt the
+ * recorded tool call.
  */
 function collectImageRefs(messages: unknown[], target: ImageRef[]): void {
-  const seen = new Set<unknown>();
-
   for (let mIdx = 0; mIdx < messages.length; mIdx++) {
     const msg = messages[mIdx];
     if (!msg || typeof msg !== "object") continue;
@@ -1001,20 +837,6 @@ function collectImageRefs(messages: unknown[], target: ImageRef[]): void {
 
     const isUser = m.role === "user" || info?.role === "user";
     const defaultSource = isUser ? "user attachment" : undefined;
-
-    if (typeof m.content === "string" && isImageDataUri(m.content)) {
-      target.push({
-        type: "raw-string",
-        container: m,
-        keyOrIndex: "content",
-        meta: {
-          mime: extractMimeFromDataUri(m.content),
-          source: defaultSource,
-          rawBase64: m.content,
-        },
-        messageIndex: mIdx,
-      });
-    }
 
     const parts = Array.isArray(m.parts)
       ? m.parts
@@ -1037,107 +859,37 @@ function collectImageRefs(messages: unknown[], target: ImageRef[]): void {
           autoName = `[Image ${userImageAttachmentIndex}]`;
         }
 
-        const meta = extractImageMeta(part, defaultSource, autoName);
-        const refType = p.inlineData ? "gemini-part" : "part";
         target.push({
-          type: refType,
           container: parts,
           keyOrIndex: pIdx,
-          meta,
+          meta: extractImageMeta(part, defaultSource, autoName),
           messageIndex: mIdx,
         });
         continue;
       }
 
-      const toolName = p.tool || p.toolName || (typeof p.type === "string" && p.type.startsWith("tool") ? "tool" : undefined);
-      const toolSource = toolName ? `tool (${toolName})` : undefined;
-      collectNestedImageRefs(part, toolSource, mIdx, target, seen);
-    }
-  }
-}
+      if (p.type !== "tool-result") continue;
 
-/**
- * Find the V1 tool part that owns a state.attachments array (or an object
- * inside one) so pruned attachments can be removed cleanly instead of
- * swapping the attachment object for a text object downstream code cannot
- * read. Returns the owning part and its attachments array, or undefined when
- * the container is not a V1 tool attachment holder.
- */
-function findV1ToolAttachmentOwner(
-  messages: unknown[],
-  messageIndex: number,
-  container: unknown
-): { part: Record<string, unknown>; state: Record<string, unknown>; attachments: unknown[] } | undefined {
-  const msg = messages[messageIndex] as Record<string, unknown> | undefined;
-  if (!msg || typeof msg !== "object") return undefined;
-  const parts = Array.isArray(msg.parts) ? msg.parts : null;
-  if (!parts) return undefined;
+      const result = p.result as Record<string, unknown> | undefined;
+      if (!result || result.type !== "content") continue;
+      const value = result.value;
+      if (!Array.isArray(value)) continue;
 
-  for (const part of parts) {
-    if (!part || typeof part !== "object") continue;
-    const p = part as Record<string, unknown>;
-    if (p.type !== "tool") continue;
-    const state = p.state as Record<string, unknown> | undefined;
-    if (!state || typeof state !== "object") continue;
-    if (state.status !== "completed") continue;
-    const attachments = state.attachments;
-    if (!Array.isArray(attachments)) continue;
-    if (attachments === container) {
-      return { part: p, state, attachments };
-    }
-    if (container && typeof container === "object" && attachments.includes(container)) {
-      return { part: p, state, attachments };
-    }
-  }
-  return undefined;
-}
-/**
- * Check if the current context event or message payload indicates compaction.
- *
- * OpenCode compaction lifecycle:
- * - Either automatic or manual (/compact), OpenCode triggers context hooks with event.agent === "compaction".
- * - Or the last user message requests a compaction/summary.
- * - Compaction should receive a text summary rather than raw image data.
- * - Passing raw base64 images into compaction can cause payload errors (OpenCode issue #14562).
- */
-export function isCompactionEvent(event: unknown, messages?: unknown[]): boolean {
-  if (!event || typeof event !== "object") return false;
-  const ev = event as Record<string, unknown>;
+      const toolSource = typeof p.name === "string" ? `tool (${p.name})` : "tool";
+      for (let vIdx = 0; vIdx < value.length; vIdx++) {
+        const entry = value[vIdx];
+        if (!entry || typeof entry !== "object") continue;
+        if (!isImagePart(entry)) continue;
 
-  // 1. Direct event.agent check (OpenCode convention)
-  if (typeof ev.agent === "string" && ev.agent.toLowerCase() === "compaction") {
-    return true;
-  }
-
-  // Also check nested session/context info if present
-  const session = ev.session as Record<string, unknown> | undefined;
-  if (typeof session?.agent === "string" && session.agent.toLowerCase() === "compaction") {
-    return true;
-  }
-
-  // 2. Check last message content / intent for compaction
-  const msgs = messages || (Array.isArray(ev.messages) ? (ev.messages as unknown[]) : null);
-  if (Array.isArray(msgs) && msgs.length > 0) {
-    const lastMsg = msgs[msgs.length - 1] as Record<string, unknown> | undefined;
-    if (lastMsg) {
-      // Check last message role or info
-      const info = lastMsg.info as Record<string, unknown> | undefined;
-      if (typeof info?.agent === "string" && info.agent.toLowerCase() === "compaction") {
-        return true;
-      }
-      const text = extractMessageText(lastMsg).trim().toLowerCase();
-      if (
-        text === "/compact" ||
-        text.startsWith("/compact ") ||
-        text.includes("compact conversation") ||
-        text.includes("summarize conversation history")
-      ) {
-        return true;
+        target.push({
+          container: value,
+          keyOrIndex: vIdx,
+          meta: extractImageMeta(entry, toolSource),
+          messageIndex: mIdx,
+        });
       }
     }
   }
-
-  return false;
 }
 
 /**
@@ -1145,10 +897,6 @@ export function isCompactionEvent(event: unknown, messages?: unknown[]): boolean
  * Dual-budget enforcement (Max Images Count + Max Payload Bytes).
  * Allocates budget greedily from newest to oldest images.
  * Pruned images are transformed in chronological order (oldest to newest).
- *
- * If event.agent === "compaction" or compaction is requested, effectiveMaxImages
- * and effectiveMaxBytes are clamped to 0 so 100% of recognized images are
- * converted to 3-point context cards with zero raw image data remaining in context.
  */
 export function pruneImages(
   event: unknown,
@@ -1167,11 +915,6 @@ export function pruneImages(
 
     if (!messages || messages.length === 0) return 0;
 
-    // Compaction detection: strip 100% of media to 3-point context cards
-    const isCompaction = isCompactionEvent(event, messages);
-    const effectiveMaxImages = isCompaction ? 0 : maxImages;
-    const effectiveMaxBytes = isCompaction ? 0 : maxBytes;
-
     const imageRefs: ImageRef[] = [];
     collectImageRefs(messages, imageRefs);
 
@@ -1189,7 +932,7 @@ export function pruneImages(
       const ref = imageRefs[i];
       const imgBytes = estimateImageBytes(ref.meta);
 
-      if (retainedCount < effectiveMaxImages && retainedBytes + imgBytes <= effectiveMaxBytes) {
+      if (retainedCount < maxImages && retainedBytes + imgBytes <= maxBytes) {
         keepIndices.add(i);
         retainedCount++;
         retainedBytes += imgBytes;
@@ -1201,15 +944,7 @@ export function pruneImages(
       return 0;
     }
 
-    // 2. Identify references to prune and transform in chronological order (oldest to newest)
-    // V1 tool attachments are collected separately: removing the entry from
-    // state.attachments and appending the card to state.output keeps both the
-    // normal provider conversion and the compaction serializer working, since
-    // neither path reads card text out of a replaced attachment object.
-    const attachmentOps = new Map<
-      Record<string, unknown>,
-      { owner: Record<string, unknown>; state: Record<string, unknown>; attachments: unknown[]; cards: string[]; targets: unknown[] }
-    >();
+    // 2. Replace every out-of-budget image in place, oldest to newest.
     let prunedCount = 0;
 
     for (let i = 0; i < imageRefs.length; i++) {
@@ -1221,18 +956,14 @@ export function pruneImages(
       if (!ref) continue;
 
       // Defensive check: avoid double-wrapping if already pruned
-      const containerObj = ref.container as Record<string, unknown>;
-      const existing = containerObj[ref.keyOrIndex];
+      const existing = ref.container[ref.keyOrIndex];
       if (isAlreadyPrunedPart(existing)) {
         continue;
       }
 
       // a. Ensure persisted to rolling buffer
       const cachedPath =
-        persistToRollingCache(ref.meta.rawBase64, ref.meta.path, ref.meta.mime) ||
-        ref.meta.path ||
-        ref.meta.url ||
-        "~/.cache/opencode/recent-images/";
+        persistToRollingCache(ref.meta.rawBase64, ref.meta.path, ref.meta.mime) || ref.meta.url;
 
       // b. Synthesize context from causal conversational turns
       const { observed, intent } = synthesizeContext(messages, ref);
@@ -1240,80 +971,17 @@ export function pruneImages(
       // c. Format 3-point card
       const cardText = formatThreePointCard(cachedPath, observed, intent);
 
-      // d1. V1 tool attachment: defer removal so array indices stay valid
-      // until every card for that tool part is collected. Only applies when
-      // the ref points directly at the attachments array or at an object
-      // inside it; anything else falls through to standard replacement so no
-      // image is kept while its card is also added.
-      const owner =
-        ref.type === "part" || ref.type === "raw-string"
-          ? findV1ToolAttachmentOwner(messages, ref.messageIndex, ref.container)
-          : undefined;
-      const ownerArray = owner?.attachments;
-      const isDirectIndex =
-        !!ownerArray && ref.container === ownerArray && typeof ref.keyOrIndex === "number";
-      const isDirectObject =
-        !!ownerArray && ref.container !== ownerArray && ownerArray.includes(ref.container);
-      if (owner && ownerArray && (isDirectIndex || isDirectObject)) {
-        let op = attachmentOps.get(owner.part);
-        if (!op) {
-          op = { owner: owner.part, state: owner.state, attachments: ownerArray, cards: [], targets: [] };
-          attachmentOps.set(owner.part, op);
-        }
-        op.cards.push(cardText);
-        op.targets.push(isDirectIndex ? (ref.keyOrIndex as number) : ref.container);
-        prunedCount++;
-        continue;
-      }
-
-      // d2. In-place replacement preserving wrapper and ID
+      // d. In-place replacement preserving any existing part id
       const existingObj = existing && typeof existing === "object" ? (existing as Record<string, unknown>) : undefined;
-      const existingId = existingObj ? existingObj.id : undefined;
+      const existingId = existingObj?.id;
 
-      if (
-        ref.type === "part" ||
-        ref.type === "tool-result-value" ||
-        ref.type === "tool-content" ||
-        ref.type === "tool-attachment"
-      ) {
-        containerObj[ref.keyOrIndex] = {
-          type: "text",
-          text: cardText,
-          ...(existingId !== undefined ? { id: existingId } : {}),
-        };
-      } else if (ref.type === "gemini-part") {
-        containerObj[ref.keyOrIndex] = {
-          text: cardText,
-        };
-      } else if (ref.type === "raw-string") {
-        containerObj[ref.keyOrIndex] = cardText;
-        if (containerObj.type === "image") {
-          containerObj.type = "text";
-        }
-      }
+      ref.container[ref.keyOrIndex] = {
+        type: "text",
+        text: cardText,
+        ...(existingId !== undefined ? { id: existingId } : {}),
+      };
 
       prunedCount++;
-    }
-
-    // e. Apply deferred V1 attachment removals: highest index first so array
-    // positions stay valid, then append cards to the tool output text.
-    for (const op of attachmentOps.values()) {
-      const numericTargets = op.targets.filter((t): t is number => typeof t === "number").sort((a, b) => b - a);
-      for (const idx of numericTargets) {
-        if (idx >= 0 && idx < op.attachments.length) {
-          op.attachments.splice(idx, 1);
-        }
-      }
-      // Object targets are attachment objects nested without a direct index:
-      // remove them by identity.
-      for (const target of op.targets) {
-        if (typeof target === "number") continue;
-        const obj = target as unknown;
-        const at = op.attachments.indexOf(obj);
-        if (at !== -1) op.attachments.splice(at, 1);
-      }
-      const prior = typeof op.state.output === "string" ? op.state.output : "";
-      op.state.output = prior ? `${prior}\n\n${op.cards.join("\n\n")}` : op.cards.join("\n\n");
     }
 
     return prunedCount;
@@ -1323,47 +991,62 @@ export function pruneImages(
   }
 }
 
-export interface OpenCodePluginContext {
-  session?: {
-    hook?: (hookName: string, handler: (event: unknown) => Promise<void> | void) => Promise<void> | void;
-  };
-  hook?: (hookName: string, handler: (_input: unknown, output: unknown) => Promise<void> | void) => void;
-  [key: string]: unknown;
+export function applyPluginOptions(options: unknown): void {
+  const o = options && typeof options === "object" ? (options as Record<string, unknown>) : {};
+
+  currentMaxImages = resolveMaxImages(o);
+  currentMaxImageBytes = resolveMaxImageBytes(o);
+
+  if (o["cacheDir"] !== undefined) {
+    if (typeof o["cacheDir"] === "string" && o["cacheDir"].trim().length > 0) {
+      setCacheDir(o["cacheDir"]);
+    } else {
+      console.error(`[prune-images] ignoring options.cacheDir: ${JSON.stringify(o["cacheDir"])}`);
+    }
+  }
 }
 
-export interface OpenCodePluginHooks {
-  "experimental.chat.messages.transform"?: (_input: unknown, output: unknown) => Promise<void> | void;
+export interface OpenCodePluginContext {
+  session?: {
+    hook?: (name: string, handler: (event: unknown) => unknown) => unknown;
+  };
+  options?: unknown;
   [key: string]: unknown;
 }
 
 export default {
   id: "opencode.prune-images",
   setup: async (ctx: OpenCodePluginContext): Promise<void> => {
-    try {
-      // 1. Session context hook (OpenCode preview / v2 architecture)
-      if (ctx?.session?.hook) {
-        await ctx.session.hook("context", async (event: unknown) => {
-          pruneImages(event, getMaxImages(), getMaxImageBytes());
-        });
-      }
+    const session = ctx?.session;
+    const hook = session?.hook;
+    if (typeof hook !== "function") {
+      console.error(
+        "[prune-images] ctx.session.hook is unavailable on this host; no hooks registered and no images will be pruned."
+      );
+      return;
+    }
 
-      // 2. Chat message transform hook
-      if (typeof ctx?.hook === "function") {
-        ctx.hook("experimental.chat.messages.transform", async (_input: unknown, output: unknown) => {
-          if (output && typeof output === "object" && Array.isArray((output as Record<string, unknown>).messages)) {
-            pruneImages(output, getMaxImages(), getMaxImageBytes());
-          }
-        });
+    applyPluginOptions(ctx?.options);
+
+    const register = async (name: string, handler: (event: unknown) => unknown): Promise<boolean> => {
+      try {
+        await hook.call(session, name, handler);
+        return true;
+      } catch (err) {
+        console.error(`[prune-images] failed to register the "${name}" session hook:`, err);
+        return false;
       }
-    } catch (err) {
-      console.error("[prune-images] setup hook registration error:", err);
+    };
+
+    const context = await register("context", (event) =>
+      pruneImages(event, getMaxImages(), getMaxImageBytes())
+    );
+    // Zero budgets on the compaction hook: the summarization request must carry
+    // cards, never raw image data.
+    const compaction = await register("compaction", (event) => pruneImages(event, 0, 0));
+
+    if (!context && !compaction) {
+      console.error("[prune-images] no session hooks registered; the plugin is inactive on this host.");
     }
   },
-  server: async (): Promise<OpenCodePluginHooks> => ({
-    "experimental.chat.messages.transform": async (_input: unknown, output: unknown) => {
-      if (output && typeof output === "object" && Array.isArray((output as Record<string, unknown>).messages)) {
-        pruneImages(output, getMaxImages(), getMaxImageBytes());
-      }
-    },
-  }),
 };

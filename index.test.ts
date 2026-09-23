@@ -17,11 +17,42 @@ import plugin, {
   getMaxImageBytes,
   parseByteString,
   enforceCacheCap,
+  resolveCacheDirFromEnv,
 } from "./index";
 
 const TEST_CACHE_DIR = path.join(os.tmpdir(), "opencode-prune-images-test-" + Date.now());
 
+const TINY_PNG =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
+function makeImageSession(nImages: number) {
+  return Array.from({ length: nImages }, (_, i) => ({
+    role: "user",
+    content: `capture ${i}`,
+    parts: [
+      { type: "text", text: `capture ${i}` },
+      { type: "file", mime: "image/png", name: `screenshot-${i}.png`, uri: TINY_PNG },
+    ],
+  }));
+}
+
+function countRawImages(messages: unknown[]): number {
+  let n = 0;
+  for (const m of messages) {
+    const parts = (m as { parts?: unknown[] })?.parts;
+    if (!Array.isArray(parts)) continue;
+    for (const p of parts) {
+      const part = p as { type?: string; uri?: unknown; data?: unknown };
+      if (part.type === "file" && typeof part.uri === "string" && part.uri.startsWith("data:image/")) n++;
+      if (part.type === "image" && part.data !== undefined) n++;
+    }
+  }
+  return n;
+}
+
 beforeEach(() => {
+  delete process.env.OPENCODE_MAX_IMAGES;
+  delete process.env.OPENCODE_MAX_IMAGE_BYTES;
   setCacheDir(TEST_CACHE_DIR);
   setMaxImages(DEFAULT_MAX_IMAGES_IN_CONTEXT);
   setMaxImageBytes(DEFAULT_MAX_IMAGE_BYTES);
@@ -202,34 +233,31 @@ test("enforces cache cap with FIFO deletion", () => {
   expect(remaining).toContain("img_004.png");
 });
 
-test("handles raw data URI strings in tool calls and content", () => {
-  const rawDataUri = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+test("never mutates tool-call input arguments that hold image-shaped data", () => {
+  const input = { image: { url: TINY_PNG, mime: "image/png" }, result: TINY_PNG };
   const messages = [
     {
-      role: "tool",
-      content: [
-        {
-          tool: "take_screenshot",
-          result: rawDataUri
-        }
-      ]
+      role: "assistant",
+      content: [{ type: "tool-call", id: "c1", name: "image_tool", input }],
     },
     {
       role: "tool",
       content: [
         {
-          tool: "take_screenshot",
-          result: rawDataUri
-        }
-      ]
-    }
+          type: "tool-result",
+          id: "c1",
+          name: "image_tool",
+          result: { type: "content", value: [{ type: "text", text: "processed" }] },
+        },
+      ],
+    },
   ];
 
-  const pruned = pruneImages({ messages }, 1);
-  expect(pruned).toBe(1);
-  expect(typeof (messages[0].content[0] as { result?: string }).result).toBe("string");
-  expect((messages[0].content[0] as { result?: string }).result).toContain("[Pruned Image:");
-  expect((messages[1].content[0] as { result?: string }).result).toBe(rawDataUri);
+  const pruned = pruneImages({ messages }, 0, 0);
+
+  expect(pruned).toBe(0);
+  expect((messages[0] as any).content[0].input).toEqual(input);
+  expect((messages[1] as any).content[0].result.value).toEqual([{ type: "text", text: "processed" }]);
 });
 
 test("handles gemini-part inlineData format correctly", () => {
@@ -368,7 +396,7 @@ test("enforces 16MB (16,777,216 bytes) wire base64 default budget", () => {
   expect(messages[0].parts[5].type).toBe("image");
 });
 
-test("compaction lifecycle: strips 100% of images to 3-point cards when event.agent === 'compaction'", () => {
+test("compaction budgets of 0 strip 100% of images to 3-point cards", () => {
   const messages = [
     {
       role: "user",
@@ -400,14 +428,7 @@ test("compaction lifecycle: strips 100% of images to 3-point cards when event.ag
     },
   ];
 
-  // Dispatch compaction event
-  const event = {
-    agent: "compaction",
-    messages,
-  };
-
-  const pruned = pruneImages(event);
-  // 100% of images (both 1 and 2) must be pruned to 3-point cards
+  const pruned = pruneImages({ messages }, 0, 0);
   expect(pruned).toBe(2);
 
   // First image -> 3-point card
@@ -435,7 +456,7 @@ test("compaction lifecycle: strips 100% of images to 3-point cards when event.ag
   }
 });
 
-test("compaction lifecycle: strips 100% of images when last message is /compact", () => {
+test("compaction-looking user text does not override the configured budgets", () => {
   const messages = [
     {
       role: "user",
@@ -444,7 +465,7 @@ test("compaction lifecycle: strips 100% of images when last message is /compact"
         {
           type: "image",
           filename: "view.png",
-          data: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+          data: TINY_PNG,
         },
       ],
     },
@@ -454,15 +475,13 @@ test("compaction lifecycle: strips 100% of images when last message is /compact"
     },
     {
       role: "user",
-      content: "/compact",
+      content: "summarize conversation history",
     },
   ];
 
-  const pruned = pruneImages({ messages });
-  expect(pruned).toBe(1);
-  expect(messages[0].parts[0].type).toBe("text");
-  expect((messages[0].parts[0] as { text?: string }).text).toContain("[Pruned Image:");
-  expect((messages[0].parts[0] as { text?: string }).text).not.toContain("data:image/");
+  const pruned = pruneImages({ messages }, 7, 16 * 1024 * 1024);
+  expect(pruned).toBe(0);
+  expect(messages[0].parts[0].type).toBe("image");
 });
 
 test("causal chain context extraction across multi-step tool loops", () => {
@@ -551,54 +570,58 @@ test("defensively avoids double-wrapping already pruned image cards", () => {
   expect((messages[0].parts[0] as { text: string }).text).not.toContain("[Pruned Image: [Pruned Image:");
 });
 
-test("plugin structure satisfies OpenCode plugin signature", async () => {
+test("setup registers the v2 context and compaction session hooks", async () => {
   expect(plugin.id).toBe("opencode.prune-images");
   expect(typeof plugin.setup).toBe("function");
-  expect(typeof plugin.server).toBe("function");
+  expect("server" in plugin).toBe(false);
 
-  const serverHooks = await plugin.server();
-  expect(typeof serverHooks["experimental.chat.messages.transform"]).toBe("function");
-
-  let hookRegistered = false;
+  const handlers: Record<string, (event: unknown) => unknown> = {};
+  const registeredNames: string[] = [];
   const mockCtx = {
     session: {
-      hook: async (name: string) => {
-        if (name === "context") hookRegistered = true;
-      }
+      hook: async (name: string, cb: (event: unknown) => unknown) => {
+        registeredNames.push(name);
+        handlers[name] = cb;
+      },
     },
-    hook: (_name: string) => {}
   };
 
   await plugin.setup(mockCtx);
-  expect(hookRegistered).toBe(true);
+  expect(registeredNames).toEqual(["context", "compaction"]);
+
+  const normal = { messages: makeImageSession(35) };
+  await handlers.context?.(normal);
+  expect(countRawImages(normal.messages)).toBe(7);
+
+  const compaction = { messages: makeImageSession(35) };
+  await handlers.compaction?.(compaction);
+  expect(countRawImages(compaction.messages)).toBe(0);
 });
 
-test("V1 tool attachments prune to output cards without breaking downstream shapes", () => {
-  // Real read-tool shape: type file attachments with data URLs under
-  // state.attachments. Pruned entries must leave the array and land in
-  // state.output, because downstream code reads card text from neither a
-  // replaced attachment object nor a rewritten attachment URL.
-  const tiny = "data:image/png;base64," + "A".repeat(1000);
+test("prunes tool-result media and keeps the tool call intact", () => {
   const messages = [
-    { role: "user", content: "check", parts: [{ type: "text", text: "check screenshots" }] },
+    { role: "user", content: [{ type: "text", text: "check screenshots" }] },
     {
       role: "assistant",
-      content: "",
-      parts: [
+      content: [
+        { type: "text", text: "reading" },
+        { type: "tool-call", id: "c1", name: "read", input: { path: "a.png" } },
+      ],
+    },
+    {
+      role: "tool",
+      content: [
         {
-          type: "tool",
-          id: "p1",
-          tool: "read",
-          callID: "c1",
-          state: {
-            status: "completed",
-            input: { filePath: "/tmp/shot.png" },
-            output: "Image read successfully",
-            time: { start: 1, end: 2 },
-            attachments: [
-              { type: "file", mime: "image/png", url: `${tiny}1` },
-              { type: "file", mime: "image/png", url: `${tiny}2` },
-              { type: "file", mime: "image/png", url: `${tiny}3` },
+          type: "tool-result",
+          id: "c1",
+          name: "read",
+          result: {
+            type: "content",
+            value: [
+              { type: "text", text: "Image read successfully" },
+              { type: "file", uri: TINY_PNG, mime: "image/png", name: "shot-1.png" },
+              { type: "file", uri: TINY_PNG, mime: "image/png", name: "shot-2.png" },
+              { type: "file", uri: TINY_PNG, mime: "image/png", name: "shot-3.png" },
             ],
           },
         },
@@ -609,24 +632,295 @@ test("V1 tool attachments prune to output cards without breaking downstream shap
   const pruned = pruneImages({ messages }, 1, 16 * 1024 * 1024);
   expect(pruned).toBe(2);
 
-  const tool = (messages[1] as any).parts[0];
-  const attachments = tool.state.attachments;
-  expect(attachments.length).toBe(1);
-  expect(attachments[0].url).toBe(`${tiny}3`);
+  const toolResult = (messages[2] as any).content[0];
+  expect(toolResult.type).toBe("tool-result");
+  expect(toolResult.id).toBe("c1");
+  expect(toolResult.name).toBe("read");
 
-  // Both cards live in the tool output next to the original text.
-  expect(tool.state.output).toContain("Image read successfully");
-  expect((tool.state.output.match(/\[Pruned Image:/g) || []).length).toBe(2);
+  const value = toolResult.result.value;
+  expect(value[0]).toEqual({ type: "text", text: "Image read successfully" });
+  expect(value[1].type).toBe("text");
+  expect(String(value[1].text)).toContain("[Pruned Image:");
+  expect(value[2].type).toBe("text");
+  expect(String(value[2].text)).toContain("[Pruned Image:");
 
-  // Downstream data URL filter must not throw and must keep the survivor.
-  const kept = attachments.filter((a: any) => a.url.startsWith("data:") && a.url.includes(","));
-  expect(kept.length).toBe(1);
+  expect(value[3].type).toBe("file");
+  expect(value[3].name).toBe("shot-3.png");
+  expect(String(value[3].uri).startsWith("data:image/")).toBe(true);
 
-  // Compaction-style serialization must show defined labels plus cards.
-  const serialized = [
-    tool.state.output,
-    ...attachments.map((item: any) => `[Attached ${item.mime}: ${item.filename ?? "file"}]`),
-  ].join("\n");
-  expect(serialized).not.toContain("undefined");
-  expect(serialized).toContain("[Pruned Image:");
+  expect((messages[1] as any).content[1].input).toEqual({ path: "a.png" });
+});
+
+test("cache dir honours XDG_CACHE_HOME and falls back to ~/.cache", () => {
+  const fallback = path.join(os.homedir(), ".cache", "opencode", "recent-images");
+
+  expect(resolveCacheDirFromEnv({ XDG_CACHE_HOME: "/tmp/xdg-cache" })).toBe(
+    path.join("/tmp/xdg-cache", "opencode", "recent-images")
+  );
+  expect(resolveCacheDirFromEnv({ XDG_CACHE_HOME: "   " })).toBe(fallback);
+  expect(resolveCacheDirFromEnv({})).toBe(fallback);
+});
+
+test("plugin options set the budgets when no env var is present", async () => {
+  const handlers: Record<string, (event: unknown) => unknown> = {};
+  await plugin.setup({
+    session: {
+      hook: async (name: string, cb: (event: unknown) => unknown) => {
+        handlers[name] = cb;
+      },
+    },
+    options: { maxImages: 3, maxImageBytes: "1MB" },
+  });
+
+  expect(getMaxImages()).toBe(3);
+  expect(getMaxImageBytes()).toBe(1024 * 1024);
+
+  const event = { messages: makeImageSession(5) };
+  await handlers.context?.(event);
+  expect(countRawImages(event.messages)).toBe(3);
+});
+
+test("env vars take precedence over plugin options", async () => {
+  process.env.OPENCODE_MAX_IMAGES = "5";
+  process.env.OPENCODE_MAX_IMAGE_BYTES = "2MB";
+  try {
+    await plugin.setup({
+      session: { hook: async () => {} },
+      options: { maxImages: 2, maxImageBytes: "1MB" },
+    });
+
+    expect(getMaxImages()).toBe(5);
+    expect(getMaxImageBytes()).toBe(2 * 1024 * 1024);
+  } finally {
+    delete process.env.OPENCODE_MAX_IMAGES;
+    delete process.env.OPENCODE_MAX_IMAGE_BYTES;
+  }
+});
+
+test("plugin options can override the cache directory", async () => {
+  const dir = path.join(os.tmpdir(), "prune-images-options-cache");
+  await plugin.setup({
+    session: { hook: async () => {} },
+    options: { cacheDir: dir },
+  });
+
+  expect(getCacheDir()).toBe(path.resolve(dir));
+});
+
+test("invalid plugin options are rejected without disturbing the defaults", async () => {
+  await plugin.setup({
+    session: { hook: async () => {} },
+    options: { maxImages: "not-a-number", maxImageBytes: -5 },
+  });
+
+  expect(getMaxImages()).toBe(DEFAULT_MAX_IMAGES_IN_CONTEXT);
+  expect(getMaxImageBytes()).toBe(DEFAULT_MAX_IMAGE_BYTES);
+});
+
+async function captureErrors<T>(fn: () => Promise<T>): Promise<{ result: T; errors: string[] }> {
+  const errors: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => {
+    errors.push(args.map(String).join(" "));
+  };
+  try {
+    return { result: await fn(), errors };
+  } finally {
+    console.error = original;
+  }
+}
+
+test("setup reports a host that exposes no session hooks", async () => {
+  const { errors } = await captureErrors(() => plugin.setup({}));
+  expect(errors.some((e) => e.includes("ctx.session.hook is unavailable"))).toBe(true);
+});
+
+test("setup keeps a working hook when the other registration fails", async () => {
+  const registered: string[] = [];
+  const { errors } = await captureErrors(() =>
+    plugin.setup({
+      session: {
+        hook: async (name: string) => {
+          if (name === "context") throw new Error("host refused");
+          registered.push(name);
+        },
+      },
+    })
+  );
+
+  expect(registered).toEqual(["compaction"]);
+  expect(errors.some((e) => e.includes('failed to register the "context"'))).toBe(true);
+  expect(errors.some((e) => e.includes("no session hooks registered"))).toBe(false);
+});
+
+test("setup reports when no session hook registers at all", async () => {
+  const { errors } = await captureErrors(() =>
+    plugin.setup({
+      session: {
+        hook: async () => {
+          throw new Error("nope");
+        },
+      },
+    })
+  );
+
+  expect(errors.some((e) => e.includes("no session hooks registered"))).toBe(true);
+});
+
+test("setup supersedes setters called before it", async () => {
+  setMaxImages(3);
+  await plugin.setup({ session: { hook: async () => {} }, options: { maxImages: 5 } });
+  expect(getMaxImages()).toBe(5);
+});
+
+test("setters remain effective after setup", async () => {
+  await plugin.setup({ session: { hook: async () => {} }, options: { maxImages: 5 } });
+  setMaxImages(2);
+  setMaxImageBytes(1024);
+
+  expect(getMaxImages()).toBe(2);
+  expect(getMaxImageBytes()).toBe(1024);
+});
+
+test("setters reject non-finite values", () => {
+  setMaxImages(Infinity);
+  setMaxImageBytes(Number.POSITIVE_INFINITY);
+
+  expect(getMaxImages()).toBe(DEFAULT_MAX_IMAGES_IN_CONTEXT);
+  expect(getMaxImageBytes()).toBe(DEFAULT_MAX_IMAGE_BYTES);
+});
+
+test("prunes an image with no retrievable payload to an explicitly uncached card", () => {
+  const messages = [
+    {
+      role: "user",
+      content: "x",
+      parts: [
+        { type: "text", text: "x" },
+        { type: "file", mime: "image/png", name: "gone.png" },
+      ],
+    },
+  ];
+
+  const pruned = pruneImages({ messages }, 0, 0);
+
+  expect(pruned).toBe(1);
+  const card = (messages[0].parts[1] as { text?: string }).text ?? "";
+  expect(card).toContain("[Pruned Image: not cached]");
+  expect(card).toContain("cannot be re-read");
+  expect(card).not.toContain("~/.cache");
+});
+
+test("server.ts shim exposes the same plugin for directory-form loading", async () => {
+  const shim = await import("./server");
+
+  expect(shim.default).toBe(plugin);
+  expect(typeof shim.default.setup).toBe("function");
+});
+
+test("DEFAULT_CACHE_DIR follows XDG_CACHE_HOME at import time", () => {
+  const indexPath = path.join(import.meta.dir, "index.ts");
+  const proc = Bun.spawnSync({
+    cmd: [
+      process.execPath,
+      "-e",
+      `const m = await import(${JSON.stringify(indexPath)}); console.log(m.DEFAULT_CACHE_DIR);`,
+    ],
+    env: { ...process.env, XDG_CACHE_HOME: "/tmp/prune-xdg-import" },
+  });
+
+  expect(proc.exitCode).toBe(0);
+  expect(proc.stdout.toString().trim()).toBe(
+    path.join("/tmp/prune-xdg-import", "opencode", "recent-images")
+  );
+});
+
+test("setup supersedes setters even without an options object", async () => {
+  setMaxImages(3);
+  await plugin.setup({ session: { hook: async () => {} } });
+
+  expect(getMaxImages()).toBe(DEFAULT_MAX_IMAGES_IN_CONTEXT);
+});
+
+test("prunes a top-level user file attachment", () => {
+  const messages = [
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "look" },
+        { type: "file", uri: TINY_PNG, mime: "image/png", name: "pasted.png" },
+      ],
+    },
+  ];
+
+  const pruned = pruneImages({ messages }, 0, 0);
+
+  expect(pruned).toBe(1);
+  expect((messages[0] as any).content[1].type).toBe("text");
+  expect(String((messages[0] as any).content[1].text)).toContain("[Pruned Image:");
+});
+
+test("the compaction hook strips tool-result media", async () => {
+  const handlers: Record<string, (event: unknown) => unknown> = {};
+  await plugin.setup({
+    session: {
+      hook: async (name: string, cb: (event: unknown) => unknown) => {
+        handlers[name] = cb;
+      },
+    },
+  });
+
+  const messages = [
+    { role: "user", content: [{ type: "text", text: "check" }] },
+    {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          id: "c1",
+          name: "read",
+          result: {
+            type: "content",
+            value: [
+              { type: "file", uri: TINY_PNG, mime: "image/png", name: "shot-1.png" },
+              { type: "file", uri: TINY_PNG, mime: "image/png", name: "shot-2.png" },
+            ],
+          },
+        },
+      ],
+    },
+  ];
+
+  await handlers.compaction?.({ messages });
+
+  const value = (messages[1] as any).content[0].result.value;
+  expect(value.every((v: any) => v.type === "text")).toBe(true);
+  expect(value.every((v: any) => String(v.text).includes("[Pruned Image:"))).toBe(true);
+});
+
+test("does not report a recall path when the cache write fails", () => {
+  const blocker = path.join(os.tmpdir(), `prune-blocker-${Date.now()}`);
+  fs.writeFileSync(blocker, "not a directory");
+  setCacheDir(path.join(blocker, "cache"));
+
+  try {
+    expect(persistToRollingCache(TINY_PNG, undefined, "image/png")).toBeUndefined();
+
+    const messages = [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "x" },
+          { type: "file", uri: TINY_PNG, mime: "image/png", name: "p.png" },
+        ],
+      },
+    ];
+
+    expect(pruneImages({ messages }, 0, 0)).toBe(1);
+    const card = String((messages[0] as any).content[1].text);
+    expect(card).toContain("[Pruned Image: not cached]");
+    expect(card).not.toContain(blocker);
+  } finally {
+    fs.rmSync(blocker, { force: true });
+  }
 });

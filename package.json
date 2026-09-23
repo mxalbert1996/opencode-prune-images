@@ -1,27 +1,47 @@
 {
-  "name": "opencode-prune-images",
+  "name": "@mxalbert/opencode-prune-images",
   "version": "1.2.0",
-  "description": "Source-only OpenCode plugin that bounds image count and payload size while preserving causal recall cards.",
-  "main": "index.ts",
-  "private": true,
+  "description": "OpenCode v2 plugin that bounds image count and payload size in the outgoing request while preserving recall cards.",
   "type": "module",
+  "main": "index.ts",
+  "exports": {
+    ".": "./index.ts",
+    "./server": "./server.ts"
+  },
+  "files": [
+    "index.ts",
+    "server.ts"
+  ],
   "scripts": {
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "bun run typecheck && bun test"
   },
   "keywords": [
     "opencode",
     "opencode-plugin",
+    "opencode-v2",
     "ai",
     "images",
+    "screenshots",
     "pruning",
     "context-management"
   ],
-  "author": "Sugam",
+  "author": "Albert Chang",
+  "contributors": [
+    "Sugam (upstream author of opencode-prune-images)"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Sugamsss/opencode-prune-images"
+    "url": "git+https://github.com/mxalbert1996/opencode-prune-images.git"
+  },
+  "homepage": "https://github.com/mxalbert1996/opencode-prune-images#readme",
+  "bugs": {
+    "url": "https://github.com/mxalbert1996/opencode-prune-images/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "devDependencies": {
     "@types/node": "^22.13.9",
